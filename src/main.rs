@@ -1,3 +1,4 @@
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 
 fn main() {
@@ -5,8 +6,11 @@ fn main() {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(_stream) => {
-                println!("accepted new connection");
+            Ok(mut stream) => {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut buf = String::new();
+                reader.read_line(&mut buf).unwrap();
+                stream.write(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
             }
             Err(e) => {
                 println!("error: {}", e);
