@@ -1,6 +1,7 @@
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use nom::ExtendInto;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -24,18 +25,42 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
         )
 }
 
+fn handle_echo(request: Request) -> Vec<Vec<u8>> {
+    let mut buf: Vec<Vec<u8>> = vec![
+        b"HTTP/1.1 200 OK\r\n".to_vec(),
+        b"Content-Type: text/plain\r\n".to_vec()
+    ];
+
+    let mut text = request.path.as_os_str().as_bytes()[6..].to_vec();
+    buf.push(
+        format!("Content-Length: {}\r\n", text.len())
+            .as_bytes()
+            .to_vec()
+    );
+    buf.push(b"\r\n".to_vec());
+    b"\r\n".extend_into(&mut text);
+    buf.push(text);
+
+    buf
+}
+
 async fn handle_connection(stream: TcpStream) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
 
     let request = parse_query(&mut reader).await?;
     let path = request.path.as_os_str().as_bytes();
 
-    let response: &[u8] = if path == b"/" {
-        b"HTTP/1.1 200 OK\r\n\r\n"
-    } else {
-        b"HTTP/1.1 404 Not Found\r\n\r\n"
+    let response: Vec<Vec<u8>> = if path == b"/" {
+        vec![b"HTTP/1.1 200 OK\r\n\r\n".to_vec()]
+    } else if path.starts_with(b"/echo/") {
+        handle_echo(request)
+    }
+    else {
+        vec![b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec()]
     };
-    reader.write(response).await?;
+    for block in response {
+        reader.write(&block).await?;
+    }
 
     Ok(())
 }
