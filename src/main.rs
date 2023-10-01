@@ -41,7 +41,7 @@ struct HeaderField {
 struct Request {
     path: PathBuf,
     headers: Vec<HeaderField>,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
 }
 
 impl Request {
@@ -60,6 +60,10 @@ impl Request {
         })
     }
 
+    fn set_body(&mut self, content: Vec<u8>) {
+        self.body = Some(content);
+    }
+
     fn get_header(&self, needle: &str) -> Option<String> {
         for HeaderField { name, value } in &self.headers {
             if name == needle {
@@ -67,6 +71,13 @@ impl Request {
             }
         }
         None
+    }
+
+    fn content_length(&self) -> usize {
+        self.get_header("Content-Length")
+            .map(|value| value.parse::<usize>().unwrap())
+            .or_else(|| Some(0usize))
+            .unwrap()
     }
 }
 
@@ -83,7 +94,7 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
         .map_or(
             build_error(
                 ErrorKind::InvalidData,
-                "Invalid header. Expecting GET /path HTTP/1.1"
+                "Invalid message line. Expecting GET /path HTTP/1.1"
             ),
             |path| {
                 Ok(PathBuf::from(path))
@@ -91,15 +102,6 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
         )?;
 
     let mut request = Request::new(path);
-
-    buf.clear();
-    reader.read_line(&mut buf).await?;
-    if buf != "\r\n" {
-        return build_error(
-            ErrorKind::InvalidData,
-            "End of status line marker not found"
-        )
-    }
 
     buf.clear();
     while let Ok(size) = reader.read_line(&mut buf).await {
@@ -124,14 +126,20 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
         buf.clear();
     }
 
-    buf.clear();
-    reader.read_line(&mut buf).await?;
-    if buf != "\r\n" {
-        return build_error(
-            ErrorKind::InvalidData,
-            "End of response headers marker not found"
-        )
-    }
+    /// Not going to read this yet. The naive solution of reading everything from this
+    /// point could easily lead to a DoS
+
+    // let content_length = request.content_length();
+    // if content_length > 0 {
+    //     buf.clear();
+    //     reader.read_line(&mut buf).await?;
+    //     if buf != "\r\n" {
+    //         return build_error(
+    //             ErrorKind::InvalidData,
+    //             "End of response headers marker not found",
+    //         );
+    //     }
+    // }
 
     Ok(request)
 }
@@ -159,7 +167,7 @@ fn handle_user_agent(request: Request) -> io::Result<Response> {
     eprintln!("Handling user agent...");
     if let Some(agent) = request.get_header("User-Agent") {
         let mut buf: Response = vec![
-            b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\n".to_vec(),
             b"Content-Type: text/plain\r\n".to_vec(),
         ];
 
