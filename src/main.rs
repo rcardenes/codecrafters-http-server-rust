@@ -1,11 +1,85 @@
+use std::env;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use nom::ExtendInto;
+use std::path::PathBuf;
+use anyhow::Result;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-type Response = Vec<Vec<u8>>;
+struct HeaderField {
+    name: String,
+    value: String,
+}
+
+enum StatusCode {
+    HttpOk,
+    NotFound,
+}
+
+enum Payload {
+    Simple(Vec<Vec<u8>>),
+}
+
+struct Response {
+    code: StatusCode,
+    headers: Vec<HeaderField>,
+    payload: Option<Payload>,
+}
+
+impl Response {
+    fn just_ok() -> Self {
+        Self {
+            code: StatusCode::HttpOk,
+            headers: vec![],
+            payload: None,
+        }
+    }
+    fn ok(content: Payload) -> Self {
+        Self {
+            code: StatusCode::HttpOk,
+            headers: vec![],
+            payload: Some(content)
+        }
+    }
+
+    fn not_found() -> Self {
+        Self {
+            code: StatusCode::NotFound,
+            headers: vec![],
+            payload: None
+        }
+    }
+
+    fn add_header(&mut self, name: &str, value: &str) {
+        self.headers.push(HeaderField {
+            name: name.to_string(),
+            value: value.to_string()
+        })
+    }
+
+    async fn write_header(&self, stream: &mut BufReader<TcpStream>) -> Result<()> {
+        let (code, msg) = match self.code {
+            StatusCode::HttpOk => (200, "OK"),
+            StatusCode::NotFound => (404, "Not Found"),
+        };
+        let status_line = format!("HTTP/1.1 {} {}\r\n", code, msg);
+        stream.write(status_line.as_bytes()).await?;
+        for header in self.headers.iter() {
+            let output = format!("{}: {}\r\n", header.name, header.value);
+            stream.write(output.as_bytes()).await?;
+        }
+
+        // End of header
+        stream.write(b"\r\n").await?;
+        stream.flush().await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct Configuration {
+    root_dir: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct Route {
@@ -31,11 +105,6 @@ impl Route {
             request.path.starts_with(&self.path)
         }
     }
-}
-
-struct HeaderField {
-    name: String,
-    value: String,
 }
 
 struct Request {
@@ -81,11 +150,11 @@ impl Request {
     }
 }
 
-fn build_error<T>(kind: ErrorKind, msg: &str) -> io::Result<T> {
-    Err(io::Error::new(kind, msg))
+fn build_error<T>(kind: ErrorKind, msg: &str) -> Result<T> {
+    Err(io::Error::new(kind, msg).into())
 }
 
-async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
+async fn parse_query(reader: &mut BufReader<TcpStream>) -> Result<Request> {
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
     let parts = buf.split_whitespace().collect::<Vec<_>>();
@@ -126,8 +195,8 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
         buf.clear();
     }
 
-    /// Not going to read this yet. The naive solution of reading everything from this
-    /// point could easily lead to a DoS
+    // Not going to read this yet. The naive solution of reading everything from this
+    // point could easily lead to a DoS
 
     // let content_length = request.content_length();
     // if content_length > 0 {
@@ -144,43 +213,25 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> io::Result<Request> {
     Ok(request)
 }
 
-fn handle_echo(request: Request) -> io::Result<Response> {
-    let mut buf: Response = vec![
-        b"HTTP/1.1 200 OK\r\n".to_vec(),
-        b"Content-Type: text/plain\r\n".to_vec()
-    ];
+fn handle_echo(request: Request) -> Result<Response> {
+    let text = request.path.as_os_str().as_bytes()[6..].to_vec();
+    let length = text.len().to_string();
 
-    let mut text = request.path.as_os_str().as_bytes()[6..].to_vec();
-    buf.push(
-        format!("Content-Length: {}\r\n", text.len())
-            .as_bytes()
-            .to_vec()
-    );
-    buf.push(b"\r\n".to_vec());
-    b"\r\n".extend_into(&mut text);
-    buf.push(text);
+    let mut response = Response::ok(Payload::Simple(vec![text]));
+    response.add_header("Content-Type", "text/plain");
+    response.add_header("Content-Length", &length);
 
-    Ok(buf)
+    Ok(response)
 }
 
-fn handle_user_agent(request: Request) -> io::Result<Response> {
-    eprintln!("Handling user agent...");
+fn handle_user_agent(request: Request) -> Result<Response> {
     if let Some(agent) = request.get_header("User-Agent") {
-        let mut buf: Response = vec![
-            b"HTTP/1.1 200 OK\r\n".to_vec(),
-            b"Content-Type: text/plain\r\n".to_vec(),
-        ];
+        let length = agent.len().to_string();
+        let mut response = Response::ok(Payload::Simple(vec![agent.into_bytes()]));
+        response.add_header("Content-Type", "text/plain");
+        response.add_header("Content-Length", &length);
 
-        buf.push(
-            format!("Content-Length: {}\r\n\r\n", agent.len())
-                .as_bytes()
-                .to_vec()
-        );
-        let mut text = agent.into_bytes();
-        b"\r\n".extend_into(&mut text);
-        buf.push(text);
-
-        Ok(buf)
+        Ok(response)
     } else {
         build_error(
             ErrorKind::InvalidData,
@@ -189,15 +240,28 @@ fn handle_user_agent(request: Request) -> io::Result<Response> {
     }
 }
 
-async fn handle_connection(stream: TcpStream, routes: &[Route]) -> io::Result<()> {
+fn handle_files(config: &Configuration, request: Request) -> io::Result<Response> {
+    unimplemented!()
+}
+
+async fn handle_connection(stream: TcpStream, routes: &[Route]) -> Result<()> {
     let mut reader = BufReader::new(stream);
 
     let request = parse_query(&mut reader).await?;
 
     for route in routes {
         if route.matches(&request) {
-            for block in (route.handler)(request)? {
-                reader.write(&block).await?;
+            let response = (route.handler)(request)?;
+
+            response.write_header(&mut reader).await?;
+            if let Some(payload) = response.payload {
+                match payload {
+                    Payload::Simple(response) => {
+                        for block in response {
+                            reader.write(&block).await?;
+                        }
+                    }
+                }
             }
             break;
         }
@@ -209,19 +273,19 @@ async fn handle_connection(stream: TcpStream, routes: &[Route]) -> io::Result<()
 fn declare_routes() -> Vec<Route> {
     vec![
         Route::new("/", true,
-                  |_| { Ok(vec![b"HTTP/1.1 200 OK\r\n\r\n".to_vec()]) }),
+                  |_, _| { Ok(Response::just_ok()) }),
         Route::new("/echo/", false, handle_echo),
         Route::new("/user-agent", true, handle_user_agent),
         // The default, it matches anything
         Route::new("", false,
-                  |_| { Ok(vec![b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec()]) }),
+                  |_, _| { Ok(Response::not_found()) }),
     ]
 }
 
 const SERVER_ADDRESS: &str = "127.0.0.1:4221";
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<()> {
     let listener = TcpListener::bind(SERVER_ADDRESS).await?;
     let routes = declare_routes();
     loop {
