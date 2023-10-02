@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -92,17 +93,23 @@ struct Route {
 impl Route {
     fn new(path: &str, exact: bool, handler: fn(Request) -> io::Result<Response>) -> Self {
         Self {
-            path: Path::new(path).to_path_buf(),
+            path: PathBuf::from(path),
             exact,
             handler
         }
     }
 
-    fn matches(&self, request: &Request) -> bool {
-        if self.exact {
+    fn matches(&self, request: &Request) -> Option<usize> {
+        let does_match = if self.exact {
             self.path == request.path
         } else {
             request.path.starts_with(&self.path)
+        };
+
+        if does_match {
+            Some(self.path.as_os_str().len())
+        } else {
+            None
         }
     }
 }
@@ -147,6 +154,18 @@ impl Request {
             .map(|value| value.parse::<usize>().unwrap())
             .or_else(|| Some(0usize))
             .unwrap()
+    }
+
+    fn strip_path_prefix(req: Request, pref_length: usize) -> Self {
+        let parts = req.path
+            .as_os_str()
+            .as_bytes()
+            .split_at(pref_length);
+        Self {
+            path: PathBuf::from(OsStr::from_bytes(parts.1)),
+            headers: req.headers,
+            body: req.body,
+        }
     }
 }
 
@@ -214,7 +233,7 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> Result<Request> {
 }
 
 fn handle_echo(request: Request) -> Result<Response> {
-    let text = request.path.as_os_str().as_bytes()[6..].to_vec();
+    let text = request.path.as_os_str().as_bytes().to_vec();
     let length = text.len().to_string();
 
     let mut response = Response::ok(Payload::Simple(vec![text]));
@@ -250,8 +269,11 @@ async fn handle_connection(stream: TcpStream, routes: &[Route]) -> Result<()> {
     let request = parse_query(&mut reader).await?;
 
     for route in routes {
-        if route.matches(&request) {
-            let response = (route.handler)(request)?;
+        if let Some(size) = route.matches(&request) {
+            let response = (route.handler)(
+                config,
+                Request::strip_path_prefix(request, size)
+            )?;
 
             response.write_header(&mut reader).await?;
             if let Some(payload) = response.payload {
