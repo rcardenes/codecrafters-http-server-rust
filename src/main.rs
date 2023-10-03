@@ -1,24 +1,31 @@
 use std::env;
 use std::ffi::OsStr;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::pin::Pin;
 use anyhow::Result;
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{fs::File, io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, pin};
+use tokio::io::AsyncBufRead;
 
+#[derive(Clone)]
 struct HeaderField {
     name: String,
     value: String,
 }
 
+#[derive(Clone)]
 enum StatusCode {
     HttpOk,
     NotFound,
+    Forbidden,
+    InternalServerError,
 }
 
 enum Payload {
     Simple(Vec<Vec<u8>>),
+    Stream(Box<dyn AsyncBufRead + Unpin + Send + Sync>)
 }
 
 struct Response {
@@ -28,13 +35,14 @@ struct Response {
 }
 
 impl Response {
-    fn just_ok() -> Self {
+    fn from_status(status: StatusCode) -> Self {
         Self {
-            code: StatusCode::HttpOk,
+            code: status,
             headers: vec![],
-            payload: None,
+            payload: None
         }
     }
+
     fn ok(content: Payload) -> Self {
         Self {
             code: StatusCode::HttpOk,
@@ -43,13 +51,11 @@ impl Response {
         }
     }
 
-    fn not_found() -> Self {
-        Self {
-            code: StatusCode::NotFound,
-            headers: vec![],
-            payload: None
-        }
-    }
+    fn not_found() -> Self { Response::from_status(StatusCode::NotFound) }
+
+    fn forbidden() -> Self { Response::from_status(StatusCode::Forbidden) }
+
+    fn internal_error() -> Self { Response::from_status(StatusCode::InternalServerError) }
 
     fn add_header(&mut self, name: &str, value: &str) {
         self.headers.push(HeaderField {
@@ -62,6 +68,8 @@ impl Response {
         let (code, msg) = match self.code {
             StatusCode::HttpOk => (200, "OK"),
             StatusCode::NotFound => (404, "Not Found"),
+            StatusCode::Forbidden => (403, "Forbidden"),
+            StatusCode::InternalServerError => (500, "Internal Server Error"),
         };
         let status_line = format!("HTTP/1.1 {} {}\r\n", code, msg);
         stream.write(status_line.as_bytes()).await?;
@@ -77,21 +85,51 @@ impl Response {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Configuration {
     root_dir: Option<PathBuf>,
 }
 
+type HandlerReturn = Result<Response>;
+type PinnedReturn<'a> = Pin<Box<dyn Future<Output=HandlerReturn> + Send + 'a>>;
+type Handler = fn(&Configuration, Request) -> PinnedReturn;
+
 #[derive(Clone)]
-struct Route {
+struct Route
+{
     path: PathBuf,
     exact: bool, // If true, the path must match `prefix` exactly
                  // Otherwise, this is a prefix
-    handler: fn(Request) -> io::Result<Response>,
+    handler: RouteTarget,
+}
+
+#[derive(Clone)]
+enum RouteTarget {
+    Static(StatusCode),
+    Dynamic(Handler),
+}
+
+impl Into<RouteTarget> for Handler {
+    fn into(self) -> RouteTarget {
+        RouteTarget::Dynamic(self)
+    }
+}
+
+impl RouteTarget {
+    async fn invoke(&self, config: &Configuration, request: Request) -> Result<Response> {
+        match self {
+            RouteTarget::Static(code) => {
+                Ok(Response::from_status(code.clone()))
+            },
+            RouteTarget::Dynamic(handler) => {
+                (handler)(config, request).await
+            },
+        }
+    }
 }
 
 impl Route {
-    fn new(path: &str, exact: bool, handler: fn(Request) -> io::Result<Response>) -> Self {
+    fn new(path: &str, exact: bool, handler: RouteTarget) -> Self {
         Self {
             path: PathBuf::from(path),
             exact,
@@ -136,10 +174,6 @@ impl Request {
         })
     }
 
-    fn set_body(&mut self, content: Vec<u8>) {
-        self.body = Some(content);
-    }
-
     fn get_header(&self, needle: &str) -> Option<String> {
         for HeaderField { name, value } in &self.headers {
             if name == needle {
@@ -149,13 +183,13 @@ impl Request {
         None
     }
 
-    fn content_length(&self) -> usize {
-        self.get_header("Content-Length")
-            .map(|value| value.parse::<usize>().unwrap())
-            .or_else(|| Some(0usize))
-            .unwrap()
-    }
-
+    // fn content_length(&self) -> usize {
+    //     self.get_header("Content-Length")
+    //         .map(|value| value.parse::<usize>().unwrap())
+    //         .or_else(|| Some(0usize))
+    //         .unwrap()
+    // }
+    //
     fn strip_path_prefix(req: Request, pref_length: usize) -> Self {
         let parts = req.path
             .as_os_str()
@@ -232,48 +266,76 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> Result<Request> {
     Ok(request)
 }
 
-fn handle_echo(request: Request) -> Result<Response> {
-    let text = request.path.as_os_str().as_bytes().to_vec();
-    let length = text.len().to_string();
+fn handle_echo(_config: &Configuration, request: Request) -> PinnedReturn {
+    Box::pin(async move {
+        let text = request.path.as_os_str().as_bytes().to_vec();
+        let length = text.len().to_string();
 
-    let mut response = Response::ok(Payload::Simple(vec![text]));
-    response.add_header("Content-Type", "text/plain");
-    response.add_header("Content-Length", &length);
-
-    Ok(response)
-}
-
-fn handle_user_agent(request: Request) -> Result<Response> {
-    if let Some(agent) = request.get_header("User-Agent") {
-        let length = agent.len().to_string();
-        let mut response = Response::ok(Payload::Simple(vec![agent.into_bytes()]));
+        let mut response = Response::ok(Payload::Simple(vec![text]));
         response.add_header("Content-Type", "text/plain");
         response.add_header("Content-Length", &length);
 
         Ok(response)
-    } else {
-        build_error(
-            ErrorKind::InvalidData,
-            "Expected User-Agent header, but not found"
-        )
-    }
+    })
 }
 
-fn handle_files(config: &Configuration, request: Request) -> io::Result<Response> {
-    unimplemented!()
+fn handle_user_agent(_config: &Configuration, request: Request) -> PinnedReturn {
+    Box::pin(async move {
+        if let Some(agent) = request.get_header("User-Agent") {
+            let length = agent.len().to_string();
+            let mut response = Response::ok(Payload::Simple(vec![agent.into_bytes()]));
+            response.add_header("Content-Type", "text/plain");
+            response.add_header("Content-Length", &length);
+
+            Ok(response)
+        } else {
+            build_error(
+                ErrorKind::InvalidData,
+                "Expected User-Agent header, but not found",
+            )
+        }
+    })
 }
 
-async fn handle_connection(stream: TcpStream, routes: &[Route]) -> Result<()> {
+fn handle_files(config: &Configuration, request: Request) -> PinnedReturn {
+    Box::pin(async move {
+        let mut full_path = match &config.root_dir {
+            Some(base_dir) => base_dir.clone(),
+            None => env::current_dir()?,
+        };
+        full_path.push(request.path);
+
+        match File::open(full_path).await {
+            Ok(file) => {
+                let size = file.metadata().await?.len();
+                let mut response = Response::ok(
+                    Payload::Stream(Box::new(BufReader::new(file)))
+                );
+                response.add_header("Content-Length", &size.to_string());
+                response.add_header("Content-Type", "application/octet-stream");
+                response.add_header("Content-Disposition", "attachment");
+                Ok(response)
+            }
+            Err(error) => match error.kind() {
+                ErrorKind::NotFound => Ok(Response::not_found()),
+                ErrorKind::PermissionDenied => Ok(Response::forbidden()),
+                _ => Ok(Response::internal_error()),
+            }
+        }
+    })
+}
+
+async fn handle_connection(config: &Configuration, stream: TcpStream, routes: &[Route]) -> Result<()> {
     let mut reader = BufReader::new(stream);
 
     let request = parse_query(&mut reader).await?;
 
     for route in routes {
         if let Some(size) = route.matches(&request) {
-            let response = (route.handler)(
+            let response = route.handler.invoke(
                 config,
                 Request::strip_path_prefix(request, size)
-            )?;
+            ).await?;
 
             response.write_header(&mut reader).await?;
             if let Some(payload) = response.payload {
@@ -282,6 +344,11 @@ async fn handle_connection(stream: TcpStream, routes: &[Route]) -> Result<()> {
                         for block in response {
                             reader.write(&block).await?;
                         }
+                    }
+                    Payload::Stream(stream) => {
+                        let mut writer = reader;
+                        pin!(stream);
+                        io::copy_buf(&mut stream, &mut writer).await?;
                     }
                 }
             }
@@ -294,29 +361,46 @@ async fn handle_connection(stream: TcpStream, routes: &[Route]) -> Result<()> {
 
 fn declare_routes() -> Vec<Route> {
     vec![
-        Route::new("/", true,
-                  |_, _| { Ok(Response::just_ok()) }),
-        Route::new("/echo/", false, handle_echo),
-        Route::new("/user-agent", true, handle_user_agent),
+        Route::new("/", true, RouteTarget::Static(StatusCode::HttpOk)),
+        Route::new("/echo/", false, RouteTarget::Dynamic(handle_echo)),
+        Route::new("/user-agent", true, RouteTarget::Dynamic(handle_user_agent)),
+        Route::new("/files/", false, RouteTarget::Dynamic(handle_files)),
         // The default, it matches anything
-        Route::new("", false,
-                  |_, _| { Ok(Response::not_found()) }),
+        Route::new("", false, RouteTarget::Static(StatusCode::NotFound)),
     ]
+}
+
+fn get_configuration() -> Configuration {
+    let mut directory: Option<PathBuf> = None;
+    let args: Vec<String> = env::args().collect();
+
+    if args.get(1) == Some(&"--directory".to_string()) {
+        if let Some(path) = args.get(2) {
+            directory = Some(PathBuf::from(path));
+        }
+    }
+
+    Configuration {
+        root_dir: directory,
+    }
 }
 
 const SERVER_ADDRESS: &str = "127.0.0.1:4221";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config = get_configuration();
     let listener = TcpListener::bind(SERVER_ADDRESS).await?;
     let routes = declare_routes();
+
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 eprintln!("Accepted connection from: {addr}");
+                let config = config.clone();
                 let cloned = routes.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, &cloned).await
+                    handle_connection(&config, stream, &cloned).await
                         .map_err(|error| {
                             eprintln!("Handling connection: {error}");
                             Ok::<_, io::Error>(())
