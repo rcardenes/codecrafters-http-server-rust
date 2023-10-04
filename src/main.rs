@@ -6,8 +6,16 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use anyhow::Result;
-use tokio::{fs::File, io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader}, net::{TcpListener, TcpStream}, pin};
-use tokio::io::AsyncBufRead;
+use tokio::{
+    fs::File,
+    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{
+        tcp::WriteHalf,
+        TcpListener,
+        TcpStream,
+    }
+};
+use tokio::io::AsyncReadExt;
 
 #[derive(Clone)]
 struct HeaderField {
@@ -18,23 +26,27 @@ struct HeaderField {
 #[derive(Clone)]
 enum StatusCode {
     HttpOk,
+    Created,
     NotFound,
     Forbidden,
     InternalServerError,
 }
 
-enum Payload {
+type Reader<'a> = dyn AsyncBufRead + Unpin + Send + Sync + 'a;
+type Writer = dyn AsyncWrite + Unpin + Send + Sync;
+
+enum Payload<'a> {
     Simple(Vec<Vec<u8>>),
-    Stream(Box<dyn AsyncBufRead + Unpin + Send + Sync>)
+    ReadStream(Box<Reader<'a>>),
 }
 
-struct Response {
+struct Response<'a> {
     code: StatusCode,
     headers: Vec<HeaderField>,
-    payload: Option<Payload>,
+    payload: Option<Payload<'a>>,
 }
 
-impl Response {
+impl<'a> Response<'a> {
     fn from_status(status: StatusCode) -> Self {
         Self {
             code: status,
@@ -43,7 +55,7 @@ impl Response {
         }
     }
 
-    fn ok(content: Payload) -> Self {
+    fn ok(content: Payload<'a>) -> Self {
         Self {
             code: StatusCode::HttpOk,
             headers: vec![],
@@ -64,9 +76,10 @@ impl Response {
         })
     }
 
-    async fn write_header(&self, stream: &mut BufReader<TcpStream>) -> Result<()> {
+    async fn write_header<'b>(&self, stream: &mut WriteHalf<'b>) -> Result<()> {
         let (code, msg) = match self.code {
             StatusCode::HttpOk => (200, "OK"),
+            StatusCode::Created => (201, "Created"),
             StatusCode::NotFound => (404, "Not Found"),
             StatusCode::Forbidden => (403, "Forbidden"),
             StatusCode::InternalServerError => (500, "Internal Server Error"),
@@ -90,13 +103,22 @@ struct Configuration {
     root_dir: Option<PathBuf>,
 }
 
-type HandlerReturn = Result<Response>;
-type PinnedReturn<'a> = Pin<Box<dyn Future<Output=HandlerReturn> + Send + 'a>>;
-type Handler = fn(&Configuration, Request) -> PinnedReturn;
+type HandlerReturn<'a> = Result<Response<'a>>;
+type PinnedReturn<'a> = Pin<Box<dyn Future<Output=HandlerReturn<'a>> + Send + 'a>>;
+type Handler = for<'a> fn(&'a Configuration, Request<'a>) -> PinnedReturn<'a>;
+
+#[derive(Clone, PartialEq)]
+enum HttpVerb {
+    Unknown,
+    Any,
+    Get,
+    Post,
+}
 
 #[derive(Clone)]
 struct Route
 {
+    verb: HttpVerb,
     path: PathBuf,
     exact: bool, // If true, the path must match `prefix` exactly
                  // Otherwise, this is a prefix
@@ -116,7 +138,7 @@ impl Into<RouteTarget> for Handler {
 }
 
 impl RouteTarget {
-    async fn invoke(&self, config: &Configuration, request: Request) -> Result<Response> {
+    async fn invoke<'a>(&'a self, config: &'a Configuration, request: Request<'a>) -> Result<Response> {
         match self {
             RouteTarget::Static(code) => {
                 Ok(Response::from_status(code.clone()))
@@ -129,8 +151,9 @@ impl RouteTarget {
 }
 
 impl Route {
-    fn new(path: &str, exact: bool, handler: RouteTarget) -> Self {
+    fn new(verb: HttpVerb, path: &str, exact: bool, handler: RouteTarget) -> Self {
         Self {
+            verb,
             path: PathBuf::from(path),
             exact,
             handler
@@ -138,13 +161,14 @@ impl Route {
     }
 
     fn matches(&self, request: &Request) -> Option<usize> {
-        let does_match = if self.exact {
+        let verb_matches = request.verb == HttpVerb::Any || request.verb == self.verb;
+        let path_matches = if self.exact {
             self.path == request.path
         } else {
             request.path.starts_with(&self.path)
         };
 
-        if does_match {
+        if verb_matches && path_matches {
             Some(self.path.as_os_str().len())
         } else {
             None
@@ -152,15 +176,17 @@ impl Route {
     }
 }
 
-struct Request {
+struct Request<'a> {
+    verb: HttpVerb,
     path: PathBuf,
     headers: Vec<HeaderField>,
-    body: Option<Vec<u8>>,
+    body: Option<Payload<'a>>,
 }
 
-impl Request {
-    fn new(path: PathBuf) -> Self {
+impl<'a> Request<'a> {
+    fn new(verb: HttpVerb, path: PathBuf) -> Self {
         Self {
+            verb,
             path,
             headers: vec![],
             body: None
@@ -183,19 +209,22 @@ impl Request {
         None
     }
 
-    // fn content_length(&self) -> usize {
-    //     self.get_header("Content-Length")
-    //         .map(|value| value.parse::<usize>().unwrap())
-    //         .or_else(|| Some(0usize))
-    //         .unwrap()
-    // }
-    //
-    fn strip_path_prefix(req: Request, pref_length: usize) -> Self {
+    fn set_payload(&mut self, payload: Payload<'a>) {
+        self.body = Some(payload)
+    }
+
+    fn content_length(&self) -> Option<usize> {
+        self.get_header("Content-Length")
+            .map(|value| value.parse::<usize>().unwrap())
+    }
+
+    fn strip_path_prefix(req: Request<'a>, pref_length: usize) -> Self {
         let parts = req.path
             .as_os_str()
             .as_bytes()
             .split_at(pref_length);
         Self {
+            verb: req.verb,
             path: PathBuf::from(OsStr::from_bytes(parts.1)),
             headers: req.headers,
             body: req.body,
@@ -207,10 +236,16 @@ fn build_error<T>(kind: ErrorKind, msg: &str) -> Result<T> {
     Err(io::Error::new(kind, msg).into())
 }
 
-async fn parse_query(reader: &mut BufReader<TcpStream>) -> Result<Request> {
+async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>>
+{
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
     let parts = buf.split_whitespace().collect::<Vec<_>>();
+    let verb = match parts.get(0) {
+        Some(&"GET") => HttpVerb::Get,
+        Some(&"POST") => HttpVerb::Post,
+        _ => HttpVerb::Unknown,
+    };
     let path = parts.get(1)
         .cloned()
         .map_or(
@@ -223,7 +258,7 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> Result<Request> {
             }
         )?;
 
-    let mut request = Request::new(path);
+    let mut request = Request::new(verb, path);
 
     buf.clear();
     while let Ok(size) = reader.read_line(&mut buf).await {
@@ -248,25 +283,12 @@ async fn parse_query(reader: &mut BufReader<TcpStream>) -> Result<Request> {
         buf.clear();
     }
 
-    // Not going to read this yet. The naive solution of reading everything from this
-    // point could easily lead to a DoS
-
-    // let content_length = request.content_length();
-    // if content_length > 0 {
-    //     buf.clear();
-    //     reader.read_line(&mut buf).await?;
-    //     if buf != "\r\n" {
-    //         return build_error(
-    //             ErrorKind::InvalidData,
-    //             "End of response headers marker not found",
-    //         );
-    //     }
-    // }
+    request.set_payload(Payload::ReadStream(reader));
 
     Ok(request)
 }
 
-fn handle_echo(_config: &Configuration, request: Request) -> PinnedReturn {
+fn handle_echo<'a>(_config: &Configuration, request: Request<'a>) -> PinnedReturn<'a> {
     Box::pin(async move {
         let text = request.path.as_os_str().as_bytes().to_vec();
         let length = text.len().to_string();
@@ -279,7 +301,7 @@ fn handle_echo(_config: &Configuration, request: Request) -> PinnedReturn {
     })
 }
 
-fn handle_user_agent(_config: &Configuration, request: Request) -> PinnedReturn {
+fn handle_user_agent<'a>(_config: &Configuration, request: Request<'a>) -> PinnedReturn<'a> {
     Box::pin(async move {
         if let Some(agent) = request.get_header("User-Agent") {
             let length = agent.len().to_string();
@@ -297,7 +319,7 @@ fn handle_user_agent(_config: &Configuration, request: Request) -> PinnedReturn 
     })
 }
 
-fn handle_files(config: &Configuration, request: Request) -> PinnedReturn {
+fn handle_download_file<'a>(config: &'a Configuration, request: Request<'a>) -> PinnedReturn<'a> {
     Box::pin(async move {
         let mut full_path = match &config.root_dir {
             Some(base_dir) => base_dir.clone(),
@@ -309,7 +331,7 @@ fn handle_files(config: &Configuration, request: Request) -> PinnedReturn {
             Ok(file) => {
                 let size = file.metadata().await?.len();
                 let mut response = Response::ok(
-                    Payload::Stream(Box::new(BufReader::new(file)))
+                    Payload::ReadStream(Box::new(BufReader::new(file)))
                 );
                 response.add_header("Content-Length", &size.to_string());
                 response.add_header("Content-Type", "application/octet-stream");
@@ -325,10 +347,53 @@ fn handle_files(config: &Configuration, request: Request) -> PinnedReturn {
     })
 }
 
-async fn handle_connection(config: &Configuration, stream: TcpStream, routes: &[Route]) -> Result<()> {
-    let mut reader = BufReader::new(stream);
+const COPY_BUFFER_DEFAULT_SIZE: usize = 1024;
 
-    let request = parse_query(&mut reader).await?;
+async fn copy_bytes<'a>(reader: &mut Reader<'a>, writer: &mut Writer, len: usize, buf_size: usize) -> Result<usize> {
+    let mut remaining = len;
+
+    while remaining > 0 {
+        let mut buffer = vec![0; std::cmp::min(buf_size, remaining)];
+        remaining -= reader.read_exact(&mut buffer).await?;
+        writer.write(&buffer).await?;
+    }
+    writer.flush().await?;
+
+    Ok(len - remaining)
+}
+
+fn handle_upload_file<'a>(config: &'a Configuration, request: Request<'a>) -> PinnedReturn<'a> {
+    Box::pin (async move {
+        let mut full_path = match &config.root_dir {
+            Some(base_dir) => base_dir.clone(),
+            None => env::current_dir()?,
+        };
+        full_path.push(&request.path);
+
+        match File::create(full_path).await {
+            Ok(mut file) => {
+                if let (Some(length), Some(Payload::ReadStream(mut reader))) = (request.content_length(), request.body) {
+                    // TODO: Should probably check the actual read size
+                    copy_bytes(&mut reader, &mut file, length, COPY_BUFFER_DEFAULT_SIZE).await?;
+                    Ok(Response::from_status(StatusCode::Created))
+                } else {
+                    Ok(Response::internal_error())
+                }
+            }
+            Err(error) => match error.kind() {
+                ErrorKind::NotFound => Ok(Response::not_found()),
+                ErrorKind::PermissionDenied => Ok(Response::forbidden()),
+                _ => Ok(Response::internal_error()),
+            }
+        }
+    })
+}
+
+async fn handle_connection(config: &Configuration, mut stream: TcpStream, routes: &[Route]) -> Result<()> {
+    let (read, mut write) = stream.split();
+    let reader = BufReader::new(read);
+
+    let request = parse_query(Box::new(reader)).await?;
 
     for route in routes {
         if let Some(size) = route.matches(&request) {
@@ -337,18 +402,16 @@ async fn handle_connection(config: &Configuration, stream: TcpStream, routes: &[
                 Request::strip_path_prefix(request, size)
             ).await?;
 
-            response.write_header(&mut reader).await?;
+            response.write_header(&mut write).await?;
             if let Some(payload) = response.payload {
                 match payload {
                     Payload::Simple(response) => {
                         for block in response {
-                            reader.write(&block).await?;
+                            write.write(&block).await?;
                         }
                     }
-                    Payload::Stream(stream) => {
-                        let mut writer = reader;
-                        pin!(stream);
-                        io::copy_buf(&mut stream, &mut writer).await?;
+                    Payload::ReadStream(mut stream) => {
+                        io::copy_buf(&mut stream, &mut write).await?;
                     }
                 }
             }
@@ -361,12 +424,13 @@ async fn handle_connection(config: &Configuration, stream: TcpStream, routes: &[
 
 fn declare_routes() -> Vec<Route> {
     vec![
-        Route::new("/", true, RouteTarget::Static(StatusCode::HttpOk)),
-        Route::new("/echo/", false, RouteTarget::Dynamic(handle_echo)),
-        Route::new("/user-agent", true, RouteTarget::Dynamic(handle_user_agent)),
-        Route::new("/files/", false, RouteTarget::Dynamic(handle_files)),
+        Route::new(HttpVerb::Get, "/", true, RouteTarget::Static(StatusCode::HttpOk)),
+        Route::new(HttpVerb::Get, "/echo/", false, RouteTarget::Dynamic(handle_echo)),
+        Route::new(HttpVerb::Get,"/user-agent", true, RouteTarget::Dynamic(handle_user_agent)),
+        Route::new(HttpVerb::Get,"/files/", false, RouteTarget::Dynamic(handle_download_file)),
+        Route::new(HttpVerb::Post, "/files/", false, RouteTarget::Dynamic(handle_upload_file)),
         // The default, it matches anything
-        Route::new("", false, RouteTarget::Static(StatusCode::NotFound)),
+        Route::new(HttpVerb::Any,"", false, RouteTarget::Static(StatusCode::NotFound)),
     ]
 }
 
