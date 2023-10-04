@@ -161,7 +161,7 @@ impl Route {
     }
 
     fn matches(&self, request: &Request) -> Option<usize> {
-        let verb_matches = request.verb == HttpVerb::Any || request.verb == self.verb;
+        let verb_matches = self.verb == HttpVerb::Any || request.verb == self.verb;
         let path_matches = if self.exact {
             self.path == request.path
         } else {
@@ -390,8 +390,8 @@ fn handle_upload_file<'a>(config: &'a Configuration, request: Request<'a>) -> Pi
 }
 
 async fn handle_connection(config: &Configuration, mut stream: TcpStream, routes: &[Route]) -> Result<()> {
-    let (read, mut write) = stream.split();
-    let reader = BufReader::new(read);
+    let (read_half, mut writer) = stream.split();
+    let reader = BufReader::new(read_half);
 
     let request = parse_query(Box::new(reader)).await?;
 
@@ -402,24 +402,26 @@ async fn handle_connection(config: &Configuration, mut stream: TcpStream, routes
                 Request::strip_path_prefix(request, size)
             ).await?;
 
-            response.write_header(&mut write).await?;
+            response.write_header(&mut writer).await?;
             if let Some(payload) = response.payload {
                 match payload {
                     Payload::Simple(response) => {
                         for block in response {
-                            write.write(&block).await?;
+                            writer.write(&block).await?;
                         }
                     }
                     Payload::ReadStream(mut stream) => {
-                        io::copy_buf(&mut stream, &mut write).await?;
+                        io::copy_buf(&mut stream, &mut writer).await?;
                     }
                 }
             }
-            break;
+            return Ok(())
         }
     }
 
-    Ok(())
+    // Default: 404
+    Response::from_status(StatusCode::NotFound)
+        .write_header(&mut writer).await
 }
 
 fn declare_routes() -> Vec<Route> {
@@ -429,8 +431,6 @@ fn declare_routes() -> Vec<Route> {
         Route::new(HttpVerb::Get,"/user-agent", true, RouteTarget::Dynamic(handle_user_agent)),
         Route::new(HttpVerb::Get,"/files/", false, RouteTarget::Dynamic(handle_download_file)),
         Route::new(HttpVerb::Post, "/files/", false, RouteTarget::Dynamic(handle_upload_file)),
-        // The default, it matches anything
-        Route::new(HttpVerb::Any,"", false, RouteTarget::Static(StatusCode::NotFound)),
     ]
 }
 
