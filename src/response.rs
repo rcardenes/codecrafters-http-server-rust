@@ -1,7 +1,7 @@
+use crate::{HeaderField, Payload, StatusCode};
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::WriteHalf;
-use crate::{HeaderField, Payload, StatusCode};
 
 pub struct Response<'a> {
     code: StatusCode,
@@ -14,7 +14,7 @@ impl<'a> Response<'a> {
         Self {
             code: status,
             headers: vec![],
-            payload: None
+            payload: None,
         }
     }
 
@@ -22,15 +22,21 @@ impl<'a> Response<'a> {
         Self {
             code: StatusCode::HttpOk,
             headers: vec![],
-            payload: Some(content)
+            payload: Some(content),
         }
     }
 
-    pub fn not_found() -> Self { Response::from_status(StatusCode::NotFound) }
+    pub fn not_found() -> Self {
+        Response::from_status(StatusCode::NotFound)
+    }
 
-    pub fn forbidden() -> Self { Response::from_status(StatusCode::Forbidden) }
+    pub fn forbidden() -> Self {
+        Response::from_status(StatusCode::Forbidden)
+    }
 
-    pub fn internal_error() -> Self { Response::from_status(StatusCode::InternalServerError) }
+    pub fn internal_error() -> Self {
+        Response::from_status(StatusCode::InternalServerError)
+    }
 
     pub fn payload(&mut self) -> Option<Payload> {
         self.payload.take()
@@ -38,7 +44,7 @@ impl<'a> Response<'a> {
     pub fn add_header(&mut self, name: &str, value: &str) {
         self.headers.push(HeaderField {
             name: name.to_string(),
-            value: value.to_string()
+            value: value.to_string(),
         })
     }
 

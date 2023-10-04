@@ -1,19 +1,24 @@
+use anyhow::Result;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use anyhow::Result;
 use tokio::{
     io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{
-        TcpListener,
-        TcpStream,
-    }
+    net::{TcpListener, TcpStream},
 };
 
-use http_server_starter_rust::{HttpVerb, Payload, Reader, StatusCode, config::Configuration, request::Request, response::Response, route::{Route, RouteTarget}, build_error};
-use http_server_starter_rust::handlers::{handle_download_file, handle_echo, handle_upload_file, handle_user_agent};
+use http_server_starter_rust::handlers::{
+    handle_download_file, handle_echo, handle_upload_file, handle_user_agent,
+};
+use http_server_starter_rust::{
+    build_error,
+    config::Configuration,
+    request::Request,
+    response::Response,
+    route::{Route, RouteTarget},
+    HttpVerb, Payload, Reader, StatusCode,
+};
 
-async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>>
-{
+async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>> {
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
     let parts = buf.split_whitespace().collect::<Vec<_>>();
@@ -22,29 +27,22 @@ async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>>
         Some(&"POST") => HttpVerb::Post,
         _ => HttpVerb::Unknown,
     };
-    let path = parts.get(1)
-        .cloned()
-        .map_or(
-            build_error(
-                ErrorKind::InvalidData,
-                "Invalid message line. Expecting GET /path HTTP/1.1"
-            ),
-            |path| {
-                Ok(PathBuf::from(path))
-            }
-        )?;
+    let path = parts.get(1).cloned().map_or(
+        build_error(
+            ErrorKind::InvalidData,
+            "Invalid message line. Expecting GET /path HTTP/1.1",
+        ),
+        |path| Ok(PathBuf::from(path)),
+    )?;
 
     let mut request = Request::new(verb, path);
 
     buf.clear();
     while let Ok(size) = reader.read_line(&mut buf).await {
         if size == 0 {
-            return build_error(
-                ErrorKind::InvalidData,
-                "Invalid query. Unexpected EOF"
-            );
+            return build_error(ErrorKind::InvalidData, "Invalid query. Unexpected EOF");
         } else if buf == "\r\n" {
-            break
+            break;
         } else {
             let trimmed = buf.trim_end();
             if let Some((name, value)) = trimmed.split_once(": ") {
@@ -52,8 +50,8 @@ async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>>
             } else {
                 return build_error(
                     ErrorKind::InvalidData,
-                    &format!("Invalid header: {}", trimmed)
-                )
+                    &format!("Invalid header: {}", trimmed),
+                );
             };
         }
         buf.clear();
@@ -64,7 +62,11 @@ async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>>
     Ok(request)
 }
 
-async fn handle_connection(config: &Configuration, mut stream: TcpStream, routes: &[Route]) -> Result<()> {
+async fn handle_connection(
+    config: &Configuration,
+    mut stream: TcpStream,
+    routes: &[Route],
+) -> Result<()> {
     let (read_half, mut writer) = stream.split();
     let reader = BufReader::new(read_half);
 
@@ -72,10 +74,9 @@ async fn handle_connection(config: &Configuration, mut stream: TcpStream, routes
 
     for route in routes {
         if let Some(size) = route.matches(&request) {
-            let mut response = route.handle(
-                config,
-                Request::strip_path_prefix(request, size)
-            ).await?;
+            let mut response = route
+                .handle(config, Request::strip_path_prefix(request, size))
+                .await?;
 
             response.write_header(&mut writer).await?;
             if let Some(payload) = response.payload() {
@@ -90,22 +91,48 @@ async fn handle_connection(config: &Configuration, mut stream: TcpStream, routes
                     }
                 }
             }
-            return Ok(())
+            return Ok(());
         }
     }
 
     // Default: 404
     Response::from_status(StatusCode::NotFound)
-        .write_header(&mut writer).await
+        .write_header(&mut writer)
+        .await
 }
 
 fn declare_routes() -> Vec<Route> {
     vec![
-        Route::new(HttpVerb::Get, "/", true, RouteTarget::Static(StatusCode::HttpOk)),
-        Route::new(HttpVerb::Get, "/echo/", false, RouteTarget::Dynamic(handle_echo)),
-        Route::new(HttpVerb::Get,"/user-agent", true, RouteTarget::Dynamic(handle_user_agent)),
-        Route::new(HttpVerb::Get,"/files/", false, RouteTarget::Dynamic(handle_download_file)),
-        Route::new(HttpVerb::Post, "/files/", false, RouteTarget::Dynamic(handle_upload_file)),
+        Route::new(
+            HttpVerb::Get,
+            "/",
+            true,
+            RouteTarget::Static(StatusCode::HttpOk),
+        ),
+        Route::new(
+            HttpVerb::Get,
+            "/echo/",
+            false,
+            RouteTarget::Dynamic(handle_echo),
+        ),
+        Route::new(
+            HttpVerb::Get,
+            "/user-agent",
+            true,
+            RouteTarget::Dynamic(handle_user_agent),
+        ),
+        Route::new(
+            HttpVerb::Get,
+            "/files/",
+            false,
+            RouteTarget::Dynamic(handle_download_file),
+        ),
+        Route::new(
+            HttpVerb::Post,
+            "/files/",
+            false,
+            RouteTarget::Dynamic(handle_upload_file),
+        ),
     ]
 }
 
@@ -124,11 +151,13 @@ async fn main() -> Result<()> {
                 let config = config.clone();
                 let cloned = routes.clone();
                 tokio::spawn(async move {
-                    handle_connection(&config, stream, &cloned).await
+                    handle_connection(&config, stream, &cloned)
+                        .await
                         .map_err(|error| {
                             eprintln!("Handling connection: {error}");
                             Ok::<_, io::Error>(())
-                        }).unwrap();
+                        })
+                        .unwrap();
                 });
             }
             Err(error) => {

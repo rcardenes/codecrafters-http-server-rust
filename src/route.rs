@@ -1,13 +1,12 @@
-use anyhow::Result;
-use std::path::PathBuf;
-use crate::{Handler, HttpVerb, StatusCode};
 use crate::config::Configuration;
 use crate::request::Request;
 use crate::response::Response;
+use crate::{Handler, HttpVerb, StatusCode};
+use anyhow::Result;
+use std::path::PathBuf;
 
 #[derive(Clone)]
-pub struct Route
-{
+pub struct Route {
     verb: HttpVerb,
     path: PathBuf,
     // If `exact` is true, the path must match `prefix` exactly
@@ -29,14 +28,14 @@ impl Into<RouteTarget> for Handler {
 }
 
 impl RouteTarget {
-    pub async fn invoke<'a>(&'a self, config: &'a Configuration, request: Request<'a>) -> Result<Response> {
+    pub async fn invoke<'a>(
+        &'a self,
+        config: &'a Configuration,
+        request: Request<'a>,
+    ) -> Result<Response> {
         match self {
-            RouteTarget::Static(code) => {
-                Ok(Response::from_status(code.clone()))
-            },
-            RouteTarget::Dynamic(handler) => {
-                (handler)(config, request).await
-            },
+            RouteTarget::Static(code) => Ok(Response::from_status(code.clone())),
+            RouteTarget::Dynamic(handler) => (handler)(config, request).await,
         }
     }
 }
@@ -47,7 +46,7 @@ impl Route {
             verb,
             path: PathBuf::from(path),
             exact,
-            handler
+            handler,
         }
     }
 
@@ -66,7 +65,11 @@ impl Route {
         }
     }
 
-    pub async fn handle<'a>(&'a self, config: &'a Configuration, request: Request<'a>) -> Result<Response> {
+    pub async fn handle<'a>(
+        &'a self,
+        config: &'a Configuration,
+        request: Request<'a>,
+    ) -> Result<Response> {
         self.handler.invoke(config, request).await
     }
 }

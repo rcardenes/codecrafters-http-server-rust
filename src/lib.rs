@@ -1,16 +1,16 @@
+use crate::config::Configuration;
+use crate::request::Request;
 use anyhow::Result;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use tokio::io::{self, AsyncBufRead, AsyncWrite};
-use crate::config::Configuration;
-use crate::request::Request;
 
 pub mod config;
-pub mod route;
-pub mod response;
-pub mod request;
 pub mod handlers;
+pub mod request;
+pub mod response;
+pub mod route;
 
 // Custom types
 
@@ -18,9 +18,8 @@ pub type Reader<'a> = dyn AsyncBufRead + Unpin + Send + Sync + 'a;
 pub type Writer = dyn AsyncWrite + Unpin + Send + Sync;
 
 pub type HandlerReturn<'a> = Result<response::Response<'a>>;
-pub type PinnedReturn<'a> = Pin<Box<dyn Future<Output=HandlerReturn<'a>> + Send + 'a>>;
+pub type PinnedReturn<'a> = Pin<Box<dyn Future<Output = HandlerReturn<'a>> + Send + 'a>>;
 pub type Handler = for<'a> fn(&'a Configuration, Request<'a>) -> PinnedReturn<'a>;
-
 
 // Structs and enums
 

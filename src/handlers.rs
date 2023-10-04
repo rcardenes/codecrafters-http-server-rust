@@ -1,9 +1,15 @@
+use crate::{
+    build_error,
+    config::Configuration,
+    request::Request,
+    response::Response,
+    {Payload, PinnedReturn, Reader, StatusCode, Writer},
+};
 use anyhow::Result;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use crate::{config::Configuration, request::Request, response::Response, {Payload, PinnedReturn, Reader, StatusCode, Writer}, build_error};
 
 pub fn handle_echo<'a>(_config: &Configuration, request: Request<'a>) -> PinnedReturn<'a> {
     Box::pin(async move {
@@ -36,16 +42,18 @@ pub fn handle_user_agent<'a>(_config: &Configuration, request: Request<'a>) -> P
     })
 }
 
-pub fn handle_download_file<'a>(config: &'a Configuration, request: Request<'a>) -> PinnedReturn<'a> {
+pub fn handle_download_file<'a>(
+    config: &'a Configuration,
+    request: Request<'a>,
+) -> PinnedReturn<'a> {
     Box::pin(async move {
         let full_path = config.resolve_path(request.path())?;
 
         match File::open(full_path).await {
             Ok(file) => {
                 let size = file.metadata().await?.len();
-                let mut response = Response::ok(
-                    Payload::ReadStream(Box::new(BufReader::new(file)))
-                );
+                let mut response =
+                    Response::ok(Payload::ReadStream(Box::new(BufReader::new(file))));
                 response.add_header("Content-Length", &size.to_string());
                 response.add_header("Content-Type", "application/octet-stream");
                 response.add_header("Content-Disposition", "attachment");
@@ -55,14 +63,19 @@ pub fn handle_download_file<'a>(config: &'a Configuration, request: Request<'a>)
                 ErrorKind::NotFound => Ok(Response::not_found()),
                 ErrorKind::PermissionDenied => Ok(Response::forbidden()),
                 _ => Ok(Response::internal_error()),
-            }
+            },
         }
     })
 }
 
 const COPY_BUFFER_DEFAULT_SIZE: usize = 1024;
 
-async fn copy_bytes<'a>(reader: &mut Reader<'a>, writer: &mut Writer, len: usize, buf_size: usize) -> Result<usize> {
+async fn copy_bytes<'a>(
+    reader: &mut Reader<'a>,
+    writer: &mut Writer,
+    len: usize,
+    buf_size: usize,
+) -> Result<usize> {
     let mut remaining = len;
 
     while remaining > 0 {
@@ -75,13 +88,18 @@ async fn copy_bytes<'a>(reader: &mut Reader<'a>, writer: &mut Writer, len: usize
     Ok(len - remaining)
 }
 
-pub fn handle_upload_file<'a>(config: &'a Configuration, mut request: Request<'a>) -> PinnedReturn<'a> {
-    Box::pin (async move {
+pub fn handle_upload_file<'a>(
+    config: &'a Configuration,
+    mut request: Request<'a>,
+) -> PinnedReturn<'a> {
+    Box::pin(async move {
         let full_path = config.resolve_path(request.path())?;
 
         match File::create(full_path).await {
             Ok(mut file) => {
-                if let (Some(length), Some(Payload::ReadStream(mut reader))) = (request.content_length(), request.body()) {
+                if let (Some(length), Some(Payload::ReadStream(mut reader))) =
+                    (request.content_length(), request.body())
+                {
                     // TODO: Should probably check the actual read size
                     copy_bytes(&mut reader, &mut file, length, COPY_BUFFER_DEFAULT_SIZE).await?;
                     Ok(Response::from_status(StatusCode::Created))
@@ -93,7 +111,7 @@ pub fn handle_upload_file<'a>(config: &'a Configuration, mut request: Request<'a
                 ErrorKind::NotFound => Ok(Response::not_found()),
                 ErrorKind::PermissionDenied => Ok(Response::forbidden()),
                 _ => Ok(Response::internal_error()),
-            }
+            },
         }
     })
 }

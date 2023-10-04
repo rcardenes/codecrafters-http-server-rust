@@ -1,7 +1,7 @@
+use crate::{HeaderField, HttpVerb, Payload};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use crate::{HeaderField, HttpVerb, Payload};
 
 pub struct Request<'a> {
     verb: HttpVerb,
@@ -16,7 +16,7 @@ impl<'a> Request<'a> {
             verb,
             path,
             headers: vec![],
-            body: None
+            body: None,
         }
     }
 
@@ -35,14 +35,14 @@ impl<'a> Request<'a> {
     pub fn add_header(&mut self, name: &str, value: &str) {
         self.headers.push(HeaderField {
             name: name.to_string(),
-            value: value.to_string()
+            value: value.to_string(),
         })
     }
 
     pub fn get_header(&self, needle: &str) -> Option<String> {
         for HeaderField { name, value } in &self.headers {
             if name == needle {
-                return Some(value.to_string())
+                return Some(value.to_string());
             }
         }
         None
@@ -58,10 +58,7 @@ impl<'a> Request<'a> {
     }
 
     pub fn strip_path_prefix(req: Request<'a>, pref_length: usize) -> Self {
-        let parts = req.path
-            .as_os_str()
-            .as_bytes()
-            .split_at(pref_length);
+        let parts = req.path.as_os_str().as_bytes().split_at(pref_length);
         Self {
             verb: req.verb,
             path: PathBuf::from(OsStr::from_bytes(parts.1)),

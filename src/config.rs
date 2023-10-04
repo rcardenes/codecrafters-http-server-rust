@@ -24,7 +24,6 @@ impl Configuration {
     }
 
     pub fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
-
         let mut full_path = match &self.root_dir {
             Some(base_dir) => base_dir.clone(),
             None => env::current_dir()?,
