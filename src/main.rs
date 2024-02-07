@@ -18,11 +18,11 @@ use http_server_starter_rust::{
     HttpVerb, Payload, Reader, StatusCode,
 };
 
-async fn parse_query<'a>(mut reader: Box<Reader<'a>>) -> Result<Request<'a>> {
+async fn parse_query(mut reader: Box<Reader<'_>>) -> Result<Request> {
     let mut buf = String::new();
     reader.read_line(&mut buf).await?;
     let parts = buf.split_whitespace().collect::<Vec<_>>();
-    let verb = match parts.get(0) {
+    let verb = match parts.first() {
         Some(&"GET") => HttpVerb::Get,
         Some(&"POST") => HttpVerb::Post,
         _ => HttpVerb::Unknown,
@@ -83,7 +83,7 @@ async fn handle_connection(
                 match payload {
                     Payload::Simple(response) => {
                         for block in response {
-                            writer.write(&block).await?;
+                            writer.write_all(&block).await?;
                         }
                     }
                     Payload::ReadStream(mut stream) => {

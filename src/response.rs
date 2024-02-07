@@ -57,14 +57,14 @@ impl<'a> Response<'a> {
             StatusCode::InternalServerError => (500, "Internal Server Error"),
         };
         let status_line = format!("HTTP/1.1 {} {}\r\n", code, msg);
-        stream.write(status_line.as_bytes()).await?;
+        stream.write_all(status_line.as_bytes()).await?;
         for header in self.headers.iter() {
             let output = format!("{}: {}\r\n", header.name, header.value);
-            stream.write(output.as_bytes()).await?;
+            stream.write_all(output.as_bytes()).await?;
         }
 
         // End of header
-        stream.write(b"\r\n").await?;
+        stream.write_all(b"\r\n").await?;
         stream.flush().await?;
         Ok(())
     }

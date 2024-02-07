@@ -21,9 +21,9 @@ pub enum RouteTarget {
     Dynamic(Handler),
 }
 
-impl Into<RouteTarget> for Handler {
-    fn into(self) -> RouteTarget {
-        RouteTarget::Dynamic(self)
+impl From<Handler> for RouteTarget {
+    fn from(val: Handler) -> Self {
+        RouteTarget::Dynamic(val)
     }
 }
 

@@ -81,7 +81,7 @@ async fn copy_bytes<'a>(
     while remaining > 0 {
         let mut buffer = vec![0; std::cmp::min(buf_size, remaining)];
         remaining -= reader.read_exact(&mut buffer).await?;
-        writer.write(&buffer).await?;
+        writer.write_all(&buffer).await?;
     }
     writer.flush().await?;
 
