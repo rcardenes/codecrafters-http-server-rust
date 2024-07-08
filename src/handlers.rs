@@ -6,19 +6,32 @@ use crate::{
     {Payload, PinnedReturn, Reader, StatusCode, Writer},
 };
 use anyhow::Result;
-use std::io::ErrorKind;
+use async_compression::tokio::bufread::GzipEncoder;
+use std::io::{ErrorKind, Cursor};
 use std::os::unix::ffi::OsStrExt;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 pub fn handle_echo<'a>(_config: &Configuration, request: Request<'a>) -> PinnedReturn<'a> {
     Box::pin(async move {
-        let text = request.path().as_os_str().as_bytes().to_vec();
-        let length = text.len().to_string();
+        let raw_text = request.path().as_os_str().as_bytes().to_vec();
+        let text = if request.wants_gzip_encoding() {
+            let mut buf = vec![];
+            let _ = GzipEncoder::new(Cursor::new(raw_text)).read_to_end(&mut buf).await;
+            buf
+        } else {
+            raw_text
+        };
+        let tlen = text.len();
+        let length = tlen.to_string();
+        let payload = Payload::Simple(vec![text]);
 
-        let mut response = Response::ok(Payload::Simple(vec![text]));
+        let mut response = Response::ok(payload);
         response.add_header("Content-Type", "text/plain");
-        response.add_header("Content-Length", &length);
+
+        if tlen > 0 {
+            response.add_header("Content-Length", &length);
+        }
 
         Ok(response)
     })
@@ -54,9 +67,12 @@ pub fn handle_download_file<'a>(
         match File::open(full_path).await {
             Ok(file) => {
                 let size = file.metadata().await?.len();
+                let buf_reader = BufReader::new(file);
                 let mut response =
-                    Response::ok(Payload::ReadStream(Box::new(BufReader::new(file))));
-                response.add_header("Content-Length", &size.to_string());
+                    Response::ok(Payload::ReadStream(Box::new(buf_reader)));
+                if size > 0 {
+                    response.add_header("Content-Length", &size.to_string());
+                }
                 response.add_header("Content-Type", "application/octet-stream");
                 response.add_header("Content-Disposition", "attachment");
                 Ok(response)
