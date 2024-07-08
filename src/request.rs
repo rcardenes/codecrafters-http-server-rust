@@ -58,7 +58,9 @@ impl<'a> Request<'a> {
     }
 
     pub fn wants_gzip_encoding(&self) -> bool {
-        self.get_header("Accept-Encoding").map_or(false, |s| s == "gzip")
+        self.get_header("Accept-Encoding")
+            .map_or(false,
+                    |s| s.split(",").any(|e| e.trim() == "gzip"))
     }
 
     pub fn strip_path_prefix(req: Request<'a>, pref_length: usize) -> Self {
