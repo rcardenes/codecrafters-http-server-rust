@@ -28,9 +28,11 @@ pub fn handle_user_agent<'a>(_config: &Configuration, request: Request<'a>) -> P
     Box::pin(async move {
         if let Some(agent) = request.get_header("User-Agent") {
             let length = agent.len().to_string();
-            let mut response = Response::ok(Payload::Simple(vec![agent.into_bytes()]));
+            let mut response = Response::ok(Payload::Simple(vec![agent.as_bytes().to_owned()]));
             response.add_header("Content-Type", "text/plain");
-            response.add_header("Content-Length", &length);
+            if agent.len() > 0 {
+                response.add_header("Content-Length", &length);
+            }
 
             Ok(response)
         } else {

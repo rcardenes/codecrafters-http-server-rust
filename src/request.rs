@@ -39,10 +39,10 @@ impl<'a> Request<'a> {
         })
     }
 
-    pub fn get_header(&self, needle: &str) -> Option<String> {
+    pub fn get_header(&self, needle: &str) -> Option<&str> {
         for HeaderField { name, value } in &self.headers {
             if name == needle {
-                return Some(value.to_string());
+                return Some(value.as_str());
             }
         }
         None
@@ -55,6 +55,10 @@ impl<'a> Request<'a> {
     pub fn content_length(&self) -> Option<usize> {
         self.get_header("Content-Length")
             .map(|value| value.parse::<usize>().unwrap())
+    }
+
+    pub fn wants_gzip_encoding(&self) -> bool {
+        self.get_header("Accept-Encoding").map_or(false, |s| s == "gzip")
     }
 
     pub fn strip_path_prefix(req: Request<'a>, pref_length: usize) -> Self {

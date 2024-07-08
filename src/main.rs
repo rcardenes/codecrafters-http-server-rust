@@ -74,9 +74,14 @@ async fn handle_connection(
 
     for route in routes {
         if let Some(size) = route.matches(&request) {
+            let wants_gzip = request.wants_gzip_encoding();
             let mut response = route
                 .handle(config, Request::strip_path_prefix(request, size))
                 .await?;
+
+            if wants_gzip {
+                response.add_header("Content-Encoding", "gzip");
+            }
 
             response.write_header(&mut writer).await?;
             if let Some(payload) = response.payload() {
